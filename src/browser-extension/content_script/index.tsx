@@ -20,6 +20,7 @@ import { type ReferenceElement } from '@floating-ui/dom'
 import InnerContainer from './InnerContainer'
 import TitleBar from './TitleBar'
 import { setExternalOriginalText } from '@/common/store'
+import { bootstrapVocabularyHighlighter } from './vocabulary-highlighter'
 
 let root: Root | null = null
 const generateId = createGenerateId()
@@ -253,6 +254,10 @@ async function main() {
     const settings = await utils.getSettings()
 
     await bindHotKey(settings.hotkey)
+
+    // Fire-and-forget: highlighter is fully self-contained and swallows its own errors,
+    // so it can never block or break the primary selection-translation flow.
+    bootstrapVocabularyHighlighter()
 }
 
 export async function bindHotKey(hotkey_: string | undefined) {
