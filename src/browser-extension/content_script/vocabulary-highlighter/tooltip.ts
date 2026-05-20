@@ -58,25 +58,35 @@ const ensureTooltipStyles = (): void => {
     if (document.getElementById(TOOLTIP_STYLE_ELEMENT_ID)) return
     const style = document.createElement('style')
     style.id = TOOLTIP_STYLE_ELEMENT_ID
+    // The tooltip is the only surface where the user reads the saved
+    // translation (clicking the highlight is a no-op now), so it needs to
+    // behave like a small reading card, not a flyout. Size up to 15px,
+    // generous line-height, an explicit CJK fallback so Chinese glyphs
+    // don't fall through to whatever default the host page set.
     style.textContent = `
         #${TOOLTIP_ELEMENT_ID} {
             position: fixed !important;
             z-index: 2147483646 !important;
-            max-width: 360px !important;
-            min-width: 200px !important;
-            max-height: 60vh !important;
-            padding: 10px 14px !important;
+            max-width: 420px !important;
+            min-width: 240px !important;
+            max-height: 70vh !important;
+            padding: 14px 18px !important;
             background-color: #ffffff !important;
-            color: #1a1a1a !important;
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
-                'Helvetica Neue', Arial, sans-serif !important;
-            font-size: 13px !important;
-            line-height: 1.5 !important;
+            color: #1f1f1f !important;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI Variable',
+                'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei UI',
+                'Microsoft YaHei', 'Noto Sans CJK SC', 'Source Han Sans SC',
+                'Noto Sans SC', 'Helvetica Neue', Arial, sans-serif !important;
+            font-size: 15px !important;
+            line-height: 1.7 !important;
+            font-feature-settings: 'kern' 1, 'liga' 1 !important;
+            -webkit-font-smoothing: antialiased !important;
+            -moz-osx-font-smoothing: grayscale !important;
             border: 1px solid rgba(0, 0, 0, 0.08) !important;
-            border-radius: 6px !important;
+            border-radius: 8px !important;
             box-shadow:
-                0 2px 8px rgba(0, 0, 0, 0.08),
-                0 4px 24px rgba(0, 0, 0, 0.12) !important;
+                0 2px 10px rgba(0, 0, 0, 0.08),
+                0 8px 32px rgba(0, 0, 0, 0.12) !important;
             opacity: 0 !important;
             transition: opacity 80ms ease-out !important;
             pointer-events: auto !important;
@@ -92,19 +102,26 @@ const ensureTooltipStyles = (): void => {
         }
         #${TOOLTIP_ELEMENT_ID} strong {
             font-weight: 600 !important;
+            color: #111 !important;
         }
         #${TOOLTIP_ELEMENT_ID} code {
             font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace !important;
-            font-size: 0.92em !important;
+            font-size: 0.9em !important;
             background-color: rgba(0, 0, 0, 0.06) !important;
-            padding: 0 4px !important;
-            border-radius: 3px !important;
+            padding: 1px 5px !important;
+            border-radius: 4px !important;
         }
         @media (prefers-color-scheme: dark) {
             #${TOOLTIP_ELEMENT_ID} {
-                background-color: #2a2a2a !important;
-                color: #f0f0f0 !important;
-                border-color: rgba(255, 255, 255, 0.1) !important;
+                background-color: #1f1f1f !important;
+                color: #ececec !important;
+                border-color: rgba(255, 255, 255, 0.08) !important;
+                box-shadow:
+                    0 2px 10px rgba(0, 0, 0, 0.4),
+                    0 8px 32px rgba(0, 0, 0, 0.55) !important;
+            }
+            #${TOOLTIP_ELEMENT_ID} strong {
+                color: #ffffff !important;
             }
             #${TOOLTIP_ELEMENT_ID} code {
                 background-color: rgba(255, 255, 255, 0.08) !important;
