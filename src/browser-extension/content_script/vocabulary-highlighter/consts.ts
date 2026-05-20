@@ -1,8 +1,9 @@
-// CSS class & data attributes used by the vocabulary highlighter.
-// Kept centralised so styles/queries stay in sync if names change.
-export const HIGHLIGHT_CLASS = 'nextai-vocab-hl'
+// CSS Custom Highlight registration name + style sheet id.
+// We render via `CSS.highlights.set(HIGHLIGHT_NAME, ...)` and `::highlight()`
+// pseudo styling, so there are no inserted DOM nodes at all — zero impact
+// on the host page's layout, font metrics, or framework reconciliation.
+export const HIGHLIGHT_NAME = 'nextai-vocab-hl'
 export const STYLE_ELEMENT_ID = 'nextai-vocab-hl-styles'
-export const DATA_ATTR_ORIGINAL = 'data-nextai-vocab'
 
 // Words shorter than this are ignored — too noisy to highlight (`a`, `an`, `is`).
 export const MIN_WORD_LENGTH = 3
@@ -35,6 +36,10 @@ export const HOVER_SHOW_DELAY_MS = 150
 // the popup vanishing mid-flight; short enough that walking away still
 // dismisses snappily.
 export const HOVER_HIDE_DELAY_MS = 200
+// Throttle for the document-level mousemove that drives Highlight-API hit
+// testing. ~32ms ≈ 30Hz: smooth enough that hover transitions feel instant
+// without burning CPU on every pixel of movement.
+export const MOUSEMOVE_THROTTLE_MS = 32
 // Distance between the anchor word and the tooltip's nearest edge.
 export const TOOLTIP_GAP_PX = 6
 // Minimum gap between tooltip and the viewport edge.

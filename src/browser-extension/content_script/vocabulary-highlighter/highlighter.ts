@@ -1,20 +1,57 @@
-import { DATA_ATTR_ORIGINAL, HIGHLIGHT_CLASS, MIN_WORD_LENGTH, STYLE_ELEMENT_ID, WORD_REGEX } from './consts'
+import { HIGHLIGHT_NAME, MIN_WORD_LENGTH, STYLE_ELEMENT_ID, WORD_REGEX } from './consts'
 import { isMatch, VocabIndex } from './vocabStore'
 
+// TypeScript 5.1's lib.dom.d.ts predates the CSS Custom Highlight API. Add
+// the minimal ambient declarations we need — drop these once we move to
+// TS 5.5+ which ships them in lib.dom natively.
+declare class Highlight {
+    constructor(...ranges: Range[])
+    add(range: Range): void
+    clear(): void
+    has(range: Range): boolean
+    delete(range: Range): boolean
+    readonly size: number
+}
+type HighlightRegistry = { set(name: string, h: Highlight): HighlightRegistry; get(name: string): Highlight | undefined }
+const cssRegistry: HighlightRegistry | undefined = (CSS as unknown as { highlights?: HighlightRegistry }).highlights
+
 /**
- * Visual layer: takes a text node + a vocab index, replaces matched words
- * with `<span class="nextai-vocab-hl">…</span>` in-place.
+ * Visual layer — CSS Custom Highlight API renderer.
  *
- * Trade-off note: we use span-wrapping (and not the CSS Custom Highlight API)
- * deliberately for MVP. Wrapping survives clipboard copy as plain text, lets
- * us attach hover handlers directly, and works on every Chrome version.
- * Cost: extra DOM nodes, occasional layout shifts on highly dynamic pages.
- * v2 may swap this for `CSS.highlights.set()` once the hover/click UX lands.
+ * Previously this module wrapped each match in `<span class="…">`. That
+ * worked but had two real costs:
+ *   1. Inserting inline elements perturbed certain sites' layout (tight
+ *      letter-spacing grids, custom font-rendering pipelines, frameworks
+ *      whose reconciler treats foreign DOM as mutations to undo).
+ *   2. React/Vue pages would diff-and-restore the inserted spans, kicking
+ *      our highlights back off the page.
+ *
+ * The Custom Highlight API solves both. We register a Highlight named
+ * `nextai-vocab-hl` populated with Range objects, then a single
+ * `::highlight(...)` rule paints them. The page DOM is never modified —
+ * the host page sees the same text nodes it always had.
+ *
+ * The trade-off is that there's no DOM target for hover/click any more.
+ * `getHighlightAtPoint(x, y)` solves that by mapping a cursor position
+ * back to one of the active ranges via `caretPositionFromPoint`.
  */
 
+let highlight: Highlight | null = null
 let stylesInjected = false
 
-const injectStyles = (): void => {
+// word (original casing from page) -> list of ranges currently covering it.
+// The tooltip reads this to know which word was hovered and to anchor the
+// popup to a real screen rect via `range.getBoundingClientRect()`.
+const wordRanges = new Map<string, Range[]>()
+
+// Text nodes we've already scanned. Backed by a WeakSet so detached nodes
+// can be garbage-collected; that means we re-init the set whenever
+// `clearAllHighlights()` runs so a fresh full scan can re-process them.
+let processedNodes: WeakSet<Text> = new WeakSet()
+
+const supportsHighlightApi = (): boolean => cssRegistry !== undefined
+
+const ensureStyleElement = (): void => {
     if (stylesInjected) return
     if (document.getElementById(STYLE_ELEMENT_ID)) {
         stylesInjected = true
@@ -22,87 +59,138 @@ const injectStyles = (): void => {
     }
     const style = document.createElement('style')
     style.id = STYLE_ELEMENT_ID
-    // !important on background only — keep typography untouched to avoid
-    // reflows on sites with strict typographic grids.
     style.textContent = `
-        .${HIGHLIGHT_CLASS} {
-            background-color: rgba(255, 222, 89, 0.55) !important;
+        ::highlight(${HIGHLIGHT_NAME}) {
+            background-color: rgba(255, 222, 89, 0.55);
             background-image: linear-gradient(
                 rgba(255, 222, 89, 0.55),
                 rgba(255, 222, 89, 0.55)
-            ) !important;
-            border-radius: 2px !important;
-            padding: 0 1px !important;
-            box-decoration-break: clone;
-            -webkit-box-decoration-break: clone;
-            cursor: help;
+            );
+            border-radius: 2px;
         }
     `
     document.documentElement.appendChild(style)
     stylesInjected = true
 }
 
+const ensureHighlight = (): Highlight | null => {
+    if (highlight) return highlight
+    if (!cssRegistry) {
+        // eslint-disable-next-line no-console
+        console.warn(
+            '[vocab-highlight] CSS Custom Highlight API unavailable; highlights will not render. Requires Chrome 105+.'
+        )
+        return null
+    }
+    highlight = new Highlight()
+    cssRegistry.set(HIGHLIGHT_NAME, highlight)
+    return highlight
+}
+
+export const ensureStyles = (): void => {
+    ensureStyleElement()
+    ensureHighlight()
+}
+
 /**
- * Splits a text node into [plain | <span> | plain | <span> | ...] pieces
- * based on matches against the vocab index.
- *
- * Returns the number of highlights produced. Returns 0 (and leaves the node
- * untouched) if there are no matches — important: do NOT replace nodes
- * unnecessarily, that triggers expensive site-level mutation handlers
- * on React/Vue pages.
+ * Scan `node`'s text for matches and register one Range per match into the
+ * Highlight. Returns the number of ranges added. Idempotent per text node
+ * (we skip nodes we've already processed).
  */
 export const highlightTextNode = (node: Text, index: VocabIndex): number => {
+    const h = ensureHighlight()
+    if (!h) return 0
+    if (processedNodes.has(node)) return 0
     const text = node.nodeValue
-    if (!text) return 0
-    if (text.length < MIN_WORD_LENGTH) return 0
+    if (!text || text.length < MIN_WORD_LENGTH) {
+        processedNodes.add(node)
+        return 0
+    }
 
     WORD_REGEX.lastIndex = 0
-    const matches: Array<{ start: number; end: number; word: string }> = []
+    let count = 0
     for (const m of text.matchAll(WORD_REGEX)) {
         const word = m[0]
         if (word.length < MIN_WORD_LENGTH) continue
         if (!isMatch(index, word)) continue
-        matches.push({ start: m.index!, end: m.index! + word.length, word })
+        const range = new Range()
+        range.setStart(node, m.index!)
+        range.setEnd(node, m.index! + word.length)
+        h.add(range)
+        const bucket = wordRanges.get(word) ?? []
+        bucket.push(range)
+        wordRanges.set(word, bucket)
+        count++
     }
-    if (matches.length === 0) return 0
-
-    const parent = node.parentNode
-    if (!parent) return 0
-
-    const frag = document.createDocumentFragment()
-    let cursor = 0
-    for (const m of matches) {
-        if (m.start > cursor) {
-            frag.appendChild(document.createTextNode(text.slice(cursor, m.start)))
-        }
-        const span = document.createElement('span')
-        span.className = HIGHLIGHT_CLASS
-        span.setAttribute(DATA_ATTR_ORIGINAL, m.word)
-        span.textContent = m.word
-        frag.appendChild(span)
-        cursor = m.end
-    }
-    if (cursor < text.length) {
-        frag.appendChild(document.createTextNode(text.slice(cursor)))
-    }
-    parent.replaceChild(frag, node)
-    return matches.length
+    processedNodes.add(node)
+    return count
 }
 
-export const ensureStyles = (): void => injectStyles()
+/**
+ * Drop every range we've added and reset the processed-node cache so the
+ * next scan starts from scratch. Used by the slow-path live refresh.
+ */
+export const clearAllHighlights = (): void => {
+    if (highlight) highlight.clear()
+    wordRanges.clear()
+    processedNodes = new WeakSet()
+}
 
 /**
- * Removes all highlights inserted by this module — used when the user
- * disables the feature mid-session. Restores original text nodes so the
- * page is exactly as it was before.
+ * Map a viewport point to one of our highlighted ranges, if any.
+ *
+ * Used by the tooltip's hover and click handlers in lieu of the
+ * mouseover-on-span pattern. Pre-filter by bounding rect to keep the
+ * comparePoint loop bounded — typical pages have a few dozen highlights
+ * but pathological cases can have hundreds.
  */
-export const clearAllHighlights = (root: ParentNode = document): void => {
-    const spans = root.querySelectorAll<HTMLElement>(`span.${HIGHLIGHT_CLASS}`)
-    spans.forEach((span) => {
-        const parent = span.parentNode
-        if (!parent) return
-        parent.replaceChild(document.createTextNode(span.textContent ?? ''), span)
-        // Merge adjacent text nodes that the unwrap creates.
-        parent.normalize()
-    })
+export interface HighlightHit {
+    word: string
+    range: Range
+}
+
+export const getHighlightAtPoint = (x: number, y: number): HighlightHit | null => {
+    if (wordRanges.size === 0) return null
+
+    let caretNode: Node | null = null
+    let caretOffset = 0
+    const docAny = document as Document & {
+        caretPositionFromPoint?: (x: number, y: number) => { offsetNode: Node; offset: number } | null
+        caretRangeFromPoint?: (x: number, y: number) => Range | null
+    }
+    if (typeof docAny.caretPositionFromPoint === 'function') {
+        const pos = docAny.caretPositionFromPoint(x, y)
+        if (pos) {
+            caretNode = pos.offsetNode
+            caretOffset = pos.offset
+        }
+    } else if (typeof docAny.caretRangeFromPoint === 'function') {
+        const r = docAny.caretRangeFromPoint(x, y)
+        if (r) {
+            caretNode = r.startContainer
+            caretOffset = r.startOffset
+        }
+    }
+    if (!caretNode) return null
+
+    for (const [word, ranges] of wordRanges) {
+        for (const range of ranges) {
+            let rect: DOMRect
+            try {
+                rect = range.getBoundingClientRect()
+            } catch {
+                continue
+            }
+            if (rect.width === 0 && rect.height === 0) continue
+            if (x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) continue
+            try {
+                if (range.comparePoint(caretNode, caretOffset) === 0) {
+                    return { word, range }
+                }
+            } catch {
+                // Detached node — stale range from a DOM mutation. Skip.
+            }
+        }
+    }
+    return null
 }

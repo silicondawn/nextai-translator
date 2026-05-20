@@ -1,11 +1,5 @@
 import { popupCardID, popupThumbID } from '../consts'
-import {
-    HIGHLIGHT_CLASS,
-    MAX_TEXT_NODES,
-    MUTATION_DEBOUNCE_MS,
-    SCAN_CHUNK_SIZE,
-    TOOLTIP_ELEMENT_ID,
-} from './consts'
+import { MAX_TEXT_NODES, MUTATION_DEBOUNCE_MS, SCAN_CHUNK_SIZE, TOOLTIP_ELEMENT_ID } from './consts'
 import { highlightTextNode } from './highlighter'
 import { VocabIndex } from './vocabStore'
 
@@ -47,8 +41,8 @@ const shouldSkipNode = (node: Node): boolean => {
             // Don't highlight inside our own hover tooltip — its content is
             // already-saved descriptions, recursive highlighting is noise.
             if (el.id === TOOLTIP_ELEMENT_ID) return true
-            // Our own previously-inserted spans — leave them alone.
-            if (el.classList && el.classList.contains(HIGHLIGHT_CLASS)) return true
+            // (No span-based highlight class to skip any more — the Custom
+            // Highlight API renderer leaves the host DOM untouched.)
         }
         cur = cur.parentNode
     }

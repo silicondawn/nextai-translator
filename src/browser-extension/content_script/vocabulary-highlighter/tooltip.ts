@@ -1,13 +1,13 @@
 import {
-    DATA_ATTR_ORIGINAL,
-    HIGHLIGHT_CLASS,
     HOVER_HIDE_DELAY_MS,
     HOVER_SHOW_DELAY_MS,
+    MOUSEMOVE_THROTTLE_MS,
     TOOLTIP_ELEMENT_ID,
     TOOLTIP_GAP_PX,
     TOOLTIP_STYLE_ELEMENT_ID,
     TOOLTIP_VIEWPORT_PADDING_PX,
 } from './consts'
+import { getHighlightAtPoint, HighlightHit } from './highlighter'
 import { lookupDescription, VocabIndex } from './vocabStore'
 
 /**
@@ -17,14 +17,17 @@ import { lookupDescription, VocabIndex } from './vocabStore'
  *   - Singleton DOM element (id `nextai-vocab-hl-tooltip`) shared by every
  *     highlight on the page. Hovering between adjacent highlights reuses
  *     the same element, avoiding flicker and DOM churn.
- *   - Event delegation on `document` (capture phase) — never bind listeners
- *     to individual span elements. Survives DOM rewrites by SPAs.
+ *   - Hit-testing via `getHighlightAtPoint` (caretPositionFromPoint +
+ *     Range.comparePoint). The page DOM has no span anchors any more — the
+ *     Custom Highlight API renderer paints highlights as pure pseudo
+ *     overlays. mousemove is throttled to ~32ms so the bookkeeping cost
+ *     stays small even on pages with hundreds of highlighted words.
  *   - 150ms show-delay so passing the cursor across text doesn't flash a
  *     tooltip on every word. 200ms hide-delay lets the cursor travel from
  *     the anchor word onto the tooltip without it disappearing mid-flight;
  *     mouseenter on the tooltip cancels the pending hide so the user can
  *     hover over its body and read freely. Moving away resumes the hide.
- *   - Click on a highlighted span calls the injected `onActivate` callback
+ *   - Click on a highlighted range calls the injected `onActivate` callback
  *     (wired in `content_script/index.tsx` to `showPopupCard`). The tooltip
  *     itself stays UI-only — it does not import the heavy translator code.
  */
@@ -34,26 +37,27 @@ export interface MountTooltipOptions {
     // index (e.g. as a streaming translation fills in the description) without
     // tearing down the tooltip element or its listeners.
     getIndex: () => VocabIndex
-    onActivate?: (word: string, anchor: HTMLElement) => void
+    // `anchor` is anything with getBoundingClientRect — typically a Range now
+    // that we use the Highlight API. Compatible with @floating-ui/dom's
+    // ReferenceElement so callers can hand it straight to showPopupCard.
+    onActivate?: (word: string, anchor: { getBoundingClientRect: () => DOMRect }) => void
 }
 
 interface TooltipState {
     element: HTMLDivElement
     showTimer: number | null
     hideTimer: number | null
-    currentTarget: HTMLElement | null
+    currentHit: HighlightHit | null
+    mousemoveLastAt: number
 }
 
 let state: TooltipState | null = null
+let activeGetIndex: (() => VocabIndex) | null = null
 
 const ensureTooltipStyles = (): void => {
     if (document.getElementById(TOOLTIP_STYLE_ELEMENT_ID)) return
     const style = document.createElement('style')
     style.id = TOOLTIP_STYLE_ELEMENT_ID
-    // All declarations are !important to survive aggressive site CSS resets.
-    // The tooltip is intentionally simple — no animations beyond a brief fade,
-    // no arrow, no shadow DOM (keeps the bundle small; the existing
-    // highlighter.ts uses the same plain-style-tag pattern).
     style.textContent = `
         #${TOOLTIP_ELEMENT_ID} {
             position: fixed !important;
@@ -75,13 +79,7 @@ const ensureTooltipStyles = (): void => {
                 0 4px 24px rgba(0, 0, 0, 0.12) !important;
             opacity: 0 !important;
             transition: opacity 80ms ease-out !important;
-            /* pointer-events: auto so the tooltip itself can receive
-               mouseenter/leave — that's how we let the cursor travel from
-               the highlight word onto the tooltip without dismissing. */
             pointer-events: auto !important;
-            /* Translator descriptions are multi-line (phonetic + sense + example +
-               bilingual). Preserve newlines and let the tooltip grow to its
-               natural height so the user can read the whole entry at once. */
             white-space: pre-wrap !important;
             word-break: break-word !important;
             overflow-wrap: anywhere !important;
@@ -127,12 +125,11 @@ const ensureTooltipElement = (): HTMLDivElement => {
     return el
 }
 
-const positionTooltip = (tooltip: HTMLElement, anchor: HTMLElement): void => {
+const positionTooltip = (tooltip: HTMLElement, anchorRect: DOMRect): void => {
     // Reset to top-left so width/height measurements aren't clipped by viewport edges.
     tooltip.style.left = '0px'
     tooltip.style.top = '0px'
 
-    const anchorRect = anchor.getBoundingClientRect()
     const tipRect = tooltip.getBoundingClientRect()
     const tipW = tipRect.width
     const tipH = tipRect.height
@@ -145,9 +142,6 @@ const positionTooltip = (tooltip: HTMLElement, anchor: HTMLElement): void => {
     let left = anchorRect.left + anchorRect.width / 2 - tipW / 2
     left = Math.max(pad, Math.min(left, vw - tipW - pad))
 
-    // Vertical: try above first; if no room, try below; if neither side
-    // has space (short viewport or very tall content), clamp to viewport
-    // bounds so we never anchor off-screen.
     const spaceAbove = anchorRect.top
     const spaceBelow = vh - anchorRect.bottom
     const needed = tipH + gap + pad
@@ -157,10 +151,6 @@ const positionTooltip = (tooltip: HTMLElement, anchor: HTMLElement): void => {
     } else if (spaceBelow >= needed) {
         top = anchorRect.bottom + gap
     } else {
-        // Neither side fits comfortably. Clamp so the tooltip body lives
-        // inside the viewport, even if that means overlapping the anchor.
-        // When tipH itself exceeds the viewport, pin to the top — the user
-        // sees the first lines and can click the highlight for the full card.
         if (tipH + 2 * pad > vh) {
             top = pad
         } else {
@@ -170,16 +160,6 @@ const positionTooltip = (tooltip: HTMLElement, anchor: HTMLElement): void => {
 
     tooltip.style.left = `${left}px`
     tooltip.style.top = `${top}px`
-}
-
-const findHighlightTarget = (node: EventTarget | null): HTMLElement | null => {
-    if (!(node instanceof HTMLElement)) return null
-    if (node.classList.contains(HIGHLIGHT_CLASS)) return node
-    return null
-}
-
-const wordOf = (target: HTMLElement): string => {
-    return target.getAttribute(DATA_ATTR_ORIGINAL) ?? target.textContent ?? ''
 }
 
 // Shown while the background translation is still streaming. A highlighted
@@ -210,17 +190,12 @@ const escapeHtml = (s: string): string => s.replace(/[&<>"']/g, (c) => HTML_ESCA
 
 const renderInlineMarkdown = (raw: string): string =>
     escapeHtml(raw)
-        // Bold: **text**. Non-greedy + [\s\S] so it spans newlines if needed.
-        // A partially-streamed '**word' (closing pair not yet received) just
-        // shows the literal asterisks for a moment — the next streamed chunk
-        // closes the pair and the next refresh renders it correctly.
         .replace(/\*\*([\s\S]+?)\*\*/g, '<strong>$1</strong>')
-        // Inline code: `text` on a single line.
         .replace(/`([^`\n]+)`/g, '<code>$1</code>')
 
-const renderContentFor = (target: HTMLElement, index: VocabIndex): void => {
+const renderContentFor = (word: string, index: VocabIndex): void => {
     if (!state) return
-    const description = lookupDescription(index, wordOf(target))
+    const description = lookupDescription(index, word)
     if (description && description.length > 0) {
         state.element.innerHTML = renderInlineMarkdown(description)
     } else {
@@ -228,13 +203,13 @@ const renderContentFor = (target: HTMLElement, index: VocabIndex): void => {
     }
 }
 
-const showFor = (target: HTMLElement, index: VocabIndex): void => {
+const showFor = (hit: HighlightHit, index: VocabIndex): void => {
     if (!state) return
-    renderContentFor(target, index)
+    renderContentFor(hit.word, index)
     state.element.setAttribute('aria-hidden', 'false')
-    positionTooltip(state.element, target)
+    positionTooltip(state.element, hit.range.getBoundingClientRect())
     state.element.dataset['visible'] = 'true'
-    state.currentTarget = target
+    state.currentHit = hit
 }
 
 /**
@@ -243,17 +218,17 @@ const showFor = (target: HTMLElement, index: VocabIndex): void => {
  * description appears as it arrives, without disrupting the hover state.
  */
 export const refreshTooltipContent = (): void => {
-    if (!state || !state.currentTarget) return
-    const target = state.currentTarget
-    // Bail if the anchor got removed from the DOM in the meantime.
-    if (!target.isConnected) return
+    if (!state || !state.currentHit) return
+    const { word, range } = state.currentHit
+    if (!range.commonAncestorContainer.isConnected) {
+        hide()
+        return
+    }
     const index = activeGetIndex?.()
     if (!index) return
-    renderContentFor(target, index)
-    positionTooltip(state.element, target)
+    renderContentFor(word, index)
+    positionTooltip(state.element, range.getBoundingClientRect())
 }
-
-let activeGetIndex: (() => VocabIndex) | null = null
 
 const hide = (): void => {
     if (!state) return
@@ -267,7 +242,7 @@ const hide = (): void => {
     }
     state.element.dataset['visible'] = 'false'
     state.element.setAttribute('aria-hidden', 'true')
-    state.currentTarget = null
+    state.currentHit = null
 }
 
 const cancelHide = (): void => {
@@ -290,52 +265,67 @@ const scheduleHide = (): void => {
 export const mountTooltip = (opts: MountTooltipOptions): (() => void) => {
     ensureTooltipStyles()
     const element = ensureTooltipElement()
-    state = { element, showTimer: null, hideTimer: null, currentTarget: null }
+    state = { element, showTimer: null, hideTimer: null, currentHit: null, mousemoveLastAt: 0 }
     activeGetIndex = opts.getIndex
 
-    const handleOver = (e: MouseEvent): void => {
-        const target = findHighlightTarget(e.target)
-        if (!target || !state) return
-        // Re-entering the (same) anchor while a hide is queued cancels it.
+    const handleMousemove = (e: MouseEvent): void => {
+        if (!state) return
+
+        // Throttle — caret-position lookups + range hit-tests are cheap but
+        // mousemove fires per-pixel; 32ms keeps the per-second budget bounded.
+        const now = Date.now()
+        if (now - state.mousemoveLastAt < MOUSEMOVE_THROTTLE_MS) return
+        state.mousemoveLastAt = now
+
+        // Cursor over the tooltip itself — let its own mouseenter/leave
+        // handlers govern the hide schedule.
+        if (e.target instanceof Node && state.element.contains(e.target)) {
+            cancelHide()
+            return
+        }
+
+        const hit = getHighlightAtPoint(e.clientX, e.clientY)
+        if (!hit) {
+            if (state.currentHit || state.showTimer !== null) {
+                if (state.showTimer !== null) {
+                    window.clearTimeout(state.showTimer)
+                    state.showTimer = null
+                }
+                if (state.currentHit) scheduleHide()
+            }
+            return
+        }
+
+        // We're on a highlight — cancel any queued hide.
         cancelHide()
-        if (target === state.currentTarget) return
+
+        // Same range, nothing to do (avoid restarting the show delay).
+        if (state.currentHit && hit.range === state.currentHit.range) return
+
+        // New / different highlight: clear stale tooltip, queue a fresh show.
         if (state.showTimer !== null) window.clearTimeout(state.showTimer)
-        // Clear stale tooltip immediately so a fast hop between two
-        // highlights doesn't briefly show the previous description.
-        if (state.currentTarget) {
+        if (state.currentHit) {
             state.element.dataset['visible'] = 'false'
-            state.currentTarget = null
+            state.currentHit = null
         }
         state.showTimer = window.setTimeout(() => {
-            showFor(target, opts.getIndex())
+            showFor(hit, opts.getIndex())
             if (state) state.showTimer = null
         }, HOVER_SHOW_DELAY_MS)
     }
 
-    const handleOut = (e: MouseEvent): void => {
-        const target = findHighlightTarget(e.target)
-        if (!target || !state) return
-        const next = e.relatedTarget
-        // mouseout fires while moving to a descendant — guard against that
-        // (highlight spans have no element children today, but defensive).
-        if (next instanceof Node && target.contains(next)) return
-        // Mouse is travelling from the anchor word onto the tooltip body —
-        // that's the explicit "give me a chance to hover the popup" case.
-        if (next instanceof Node && state.element.contains(next)) {
-            cancelHide()
-            return
-        }
-        scheduleHide()
-    }
-
     const handleClick = (e: MouseEvent): void => {
-        const target = findHighlightTarget(e.target)
-        if (!target || !opts.onActivate) return
-        const word = wordOf(target)
-        if (!word) return
+        if (!state || !opts.onActivate) return
+        // If the click landed inside the tooltip, leave it to its own
+        // listeners (no activation; tooltip body is informational only).
+        if (e.target instanceof Node && state.element.contains(e.target)) return
+        const hit = getHighlightAtPoint(e.clientX, e.clientY)
+        if (!hit) return
         hide()
         try {
-            opts.onActivate(word, target)
+            // Range satisfies @floating-ui/dom's ReferenceElement shape, so
+            // showPopupCard can use it directly as the anchor.
+            opts.onActivate(hit.word, hit.range)
         } catch (err) {
             // eslint-disable-next-line no-console
             console.warn('[vocab-highlight] onActivate failed', err)
@@ -348,29 +338,20 @@ export const mountTooltip = (opts: MountTooltipOptions): (() => void) => {
 
     const handleTooltipLeave = (e: MouseEvent): void => {
         if (!state) return
-        const next = e.relatedTarget
-        // Returning to the currently-shown anchor — stay open.
-        if (
-            state.currentTarget &&
-            next instanceof Node &&
-            (state.currentTarget === next || state.currentTarget.contains(next))
-        ) {
-            cancelHide()
-            return
-        }
+        // If the cursor leaves the tooltip back onto its current anchor
+        // range, the next mousemove tick will cancel the hide; we still
+        // schedule it here so plain "drift onto blank page" still dismisses.
+        void e
         scheduleHide()
     }
 
     const handleScrollOrResize = (): void => {
-        // Reanchoring on scroll would jitter; hiding matches Chrome's own
-        // tooltip behaviour and is much cheaper.
-        if (state?.currentTarget) hide()
+        // Bounding rects move under scroll; hiding matches Chrome's own
+        // tooltip behaviour and is much cheaper than reanchoring.
+        if (state?.currentHit) hide()
     }
 
-    // Capture phase so we still see events on pages that stopPropagation in
-    // their own bubble handlers (common on Twitter, Notion, etc.).
-    document.addEventListener('mouseover', handleOver, true)
-    document.addEventListener('mouseout', handleOut, true)
+    document.addEventListener('mousemove', handleMousemove, true)
     document.addEventListener('click', handleClick, true)
     element.addEventListener('mouseenter', handleTooltipEnter)
     element.addEventListener('mouseleave', handleTooltipLeave)
@@ -378,8 +359,7 @@ export const mountTooltip = (opts: MountTooltipOptions): (() => void) => {
     window.addEventListener('resize', handleScrollOrResize)
 
     return () => {
-        document.removeEventListener('mouseover', handleOver, true)
-        document.removeEventListener('mouseout', handleOut, true)
+        document.removeEventListener('mousemove', handleMousemove, true)
         document.removeEventListener('click', handleClick, true)
         element.removeEventListener('mouseenter', handleTooltipEnter)
         element.removeEventListener('mouseleave', handleTooltipLeave)
