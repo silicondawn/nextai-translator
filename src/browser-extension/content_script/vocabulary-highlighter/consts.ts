@@ -30,6 +30,11 @@ export const TOOLTIP_STYLE_ELEMENT_ID = 'nextai-vocab-hl-tooltip-styles'
 // Delay before showing on hover — long enough to ignore cursor flyovers,
 // short enough that a deliberate dwell feels instant.
 export const HOVER_SHOW_DELAY_MS = 150
+// Grace window after the cursor leaves the highlight (or the tooltip). Long
+// enough that the cursor can travel from the word into the tooltip without
+// the popup vanishing mid-flight; short enough that walking away still
+// dismisses snappily.
+export const HOVER_HIDE_DELAY_MS = 200
 // Distance between the anchor word and the tooltip's nearest edge.
 export const TOOLTIP_GAP_PX = 6
 // Minimum gap between tooltip and the viewport edge.

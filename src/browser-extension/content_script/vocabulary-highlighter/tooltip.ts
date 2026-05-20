@@ -1,6 +1,7 @@
 import {
     DATA_ATTR_ORIGINAL,
     HIGHLIGHT_CLASS,
+    HOVER_HIDE_DELAY_MS,
     HOVER_SHOW_DELAY_MS,
     TOOLTIP_ELEMENT_ID,
     TOOLTIP_GAP_PX,
@@ -19,9 +20,10 @@ import { lookupDescription, VocabIndex } from './vocabStore'
  *   - Event delegation on `document` (capture phase) — never bind listeners
  *     to individual span elements. Survives DOM rewrites by SPAs.
  *   - 150ms show-delay so passing the cursor across text doesn't flash a
- *     tooltip on every word. Instant hide on mouseleave — line-clamped 3
- *     lines is small enough that users either read it in place or click to
- *     open the full translator card.
+ *     tooltip on every word. 200ms hide-delay lets the cursor travel from
+ *     the anchor word onto the tooltip without it disappearing mid-flight;
+ *     mouseenter on the tooltip cancels the pending hide so the user can
+ *     hover over its body and read freely. Moving away resumes the hide.
  *   - Click on a highlighted span calls the injected `onActivate` callback
  *     (wired in `content_script/index.tsx` to `showPopupCard`). The tooltip
  *     itself stays UI-only — it does not import the heavy translator code.
@@ -35,6 +37,7 @@ export interface MountTooltipOptions {
 interface TooltipState {
     element: HTMLDivElement
     showTimer: number | null
+    hideTimer: number | null
     currentTarget: HTMLElement | null
 }
 
@@ -69,7 +72,10 @@ const ensureTooltipStyles = (): void => {
                 0 4px 24px rgba(0, 0, 0, 0.12) !important;
             opacity: 0 !important;
             transition: opacity 80ms ease-out !important;
-            pointer-events: none !important;
+            /* pointer-events: auto so the tooltip itself can receive
+               mouseenter/leave — that's how we let the cursor travel from
+               the highlight word onto the tooltip without dismissing. */
+            pointer-events: auto !important;
             /* Translator descriptions are multi-line (phonetic + sense + example +
                bilingual). Preserve newlines and let the tooltip grow to its
                natural height so the user can read the whole entry at once. */
@@ -182,19 +188,42 @@ const hide = (): void => {
         window.clearTimeout(state.showTimer)
         state.showTimer = null
     }
+    if (state.hideTimer !== null) {
+        window.clearTimeout(state.hideTimer)
+        state.hideTimer = null
+    }
     state.element.dataset['visible'] = 'false'
     state.element.setAttribute('aria-hidden', 'true')
     state.currentTarget = null
 }
 
+const cancelHide = (): void => {
+    if (!state) return
+    if (state.hideTimer !== null) {
+        window.clearTimeout(state.hideTimer)
+        state.hideTimer = null
+    }
+}
+
+const scheduleHide = (): void => {
+    if (!state) return
+    if (state.hideTimer !== null) window.clearTimeout(state.hideTimer)
+    state.hideTimer = window.setTimeout(() => {
+        if (state) state.hideTimer = null
+        hide()
+    }, HOVER_HIDE_DELAY_MS)
+}
+
 export const mountTooltip = (opts: MountTooltipOptions): (() => void) => {
     ensureTooltipStyles()
     const element = ensureTooltipElement()
-    state = { element, showTimer: null, currentTarget: null }
+    state = { element, showTimer: null, hideTimer: null, currentTarget: null }
 
     const handleOver = (e: MouseEvent): void => {
         const target = findHighlightTarget(e.target)
         if (!target || !state) return
+        // Re-entering the (same) anchor while a hide is queued cancels it.
+        cancelHide()
         if (target === state.currentTarget) return
         if (state.showTimer !== null) window.clearTimeout(state.showTimer)
         // Clear stale tooltip immediately so a fast hop between two
@@ -211,12 +240,18 @@ export const mountTooltip = (opts: MountTooltipOptions): (() => void) => {
 
     const handleOut = (e: MouseEvent): void => {
         const target = findHighlightTarget(e.target)
-        if (!target) return
+        if (!target || !state) return
+        const next = e.relatedTarget
         // mouseout fires while moving to a descendant — guard against that
         // (highlight spans have no element children today, but defensive).
-        const next = e.relatedTarget
         if (next instanceof Node && target.contains(next)) return
-        hide()
+        // Mouse is travelling from the anchor word onto the tooltip body —
+        // that's the explicit "give me a chance to hover the popup" case.
+        if (next instanceof Node && state.element.contains(next)) {
+            cancelHide()
+            return
+        }
+        scheduleHide()
     }
 
     const handleClick = (e: MouseEvent): void => {
@@ -233,6 +268,25 @@ export const mountTooltip = (opts: MountTooltipOptions): (() => void) => {
         }
     }
 
+    const handleTooltipEnter = (): void => {
+        cancelHide()
+    }
+
+    const handleTooltipLeave = (e: MouseEvent): void => {
+        if (!state) return
+        const next = e.relatedTarget
+        // Returning to the currently-shown anchor — stay open.
+        if (
+            state.currentTarget &&
+            next instanceof Node &&
+            (state.currentTarget === next || state.currentTarget.contains(next))
+        ) {
+            cancelHide()
+            return
+        }
+        scheduleHide()
+    }
+
     const handleScrollOrResize = (): void => {
         // Reanchoring on scroll would jitter; hiding matches Chrome's own
         // tooltip behaviour and is much cheaper.
@@ -244,6 +298,8 @@ export const mountTooltip = (opts: MountTooltipOptions): (() => void) => {
     document.addEventListener('mouseover', handleOver, true)
     document.addEventListener('mouseout', handleOut, true)
     document.addEventListener('click', handleClick, true)
+    element.addEventListener('mouseenter', handleTooltipEnter)
+    element.addEventListener('mouseleave', handleTooltipLeave)
     window.addEventListener('scroll', handleScrollOrResize, { passive: true, capture: true })
     window.addEventListener('resize', handleScrollOrResize)
 
@@ -251,10 +307,13 @@ export const mountTooltip = (opts: MountTooltipOptions): (() => void) => {
         document.removeEventListener('mouseover', handleOver, true)
         document.removeEventListener('mouseout', handleOut, true)
         document.removeEventListener('click', handleClick, true)
+        element.removeEventListener('mouseenter', handleTooltipEnter)
+        element.removeEventListener('mouseleave', handleTooltipLeave)
         window.removeEventListener('scroll', handleScrollOrResize, true)
         window.removeEventListener('resize', handleScrollOrResize)
         if (state) {
             if (state.showTimer !== null) window.clearTimeout(state.showTimer)
+            if (state.hideTimer !== null) window.clearTimeout(state.hideTimer)
             state.element.remove()
             state = null
         }
