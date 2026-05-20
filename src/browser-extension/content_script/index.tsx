@@ -1,3 +1,7 @@
+// Must be the very first import. Stubs window.__TAURI_METADATA__ before any
+// Tauri module's top-level appWindow init runs, suppressing the benign
+// "Could not find window.__TAURI_METADATA__" warning on every page load.
+import './tauri-shim'
 import '../enable-dev-hmr'
 import * as utils from '@/common/utils'
 import React from 'react'
