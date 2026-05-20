@@ -30,7 +30,10 @@ import { lookupDescription, VocabIndex } from './vocabStore'
  */
 
 export interface MountTooltipOptions {
-    index: VocabIndex
+    // Live getter rather than a value: lets live-refresh swap the underlying
+    // index (e.g. as a streaming translation fills in the description) without
+    // tearing down the tooltip element or its listeners.
+    getIndex: () => VocabIndex
     onActivate?: (word: string, anchor: HTMLElement) => void
 }
 
@@ -171,16 +174,39 @@ const wordOf = (target: HTMLElement): string => {
 // the next vocabUpdated broadcast will refresh the index with the real text.
 const PENDING_PLACEHOLDER = '翻译中…'
 
-const showFor = (target: HTMLElement, index: VocabIndex): void => {
+const renderContentFor = (target: HTMLElement, index: VocabIndex): void => {
     if (!state) return
     const description = lookupDescription(index, wordOf(target))
     const content = description && description.length > 0 ? description : PENDING_PLACEHOLDER
     state.element.textContent = content
+}
+
+const showFor = (target: HTMLElement, index: VocabIndex): void => {
+    if (!state) return
+    renderContentFor(target, index)
     state.element.setAttribute('aria-hidden', 'false')
     positionTooltip(state.element, target)
     state.element.dataset['visible'] = 'true'
     state.currentTarget = target
 }
+
+/**
+ * Re-render the tooltip's text and reposition (height may change) using the
+ * live vocab index. Called by the live-refresh fast path so a streaming
+ * description appears as it arrives, without disrupting the hover state.
+ */
+export const refreshTooltipContent = (): void => {
+    if (!state || !state.currentTarget) return
+    const target = state.currentTarget
+    // Bail if the anchor got removed from the DOM in the meantime.
+    if (!target.isConnected) return
+    const index = activeGetIndex?.()
+    if (!index) return
+    renderContentFor(target, index)
+    positionTooltip(state.element, target)
+}
+
+let activeGetIndex: (() => VocabIndex) | null = null
 
 const hide = (): void => {
     if (!state) return
@@ -218,6 +244,7 @@ export const mountTooltip = (opts: MountTooltipOptions): (() => void) => {
     ensureTooltipStyles()
     const element = ensureTooltipElement()
     state = { element, showTimer: null, hideTimer: null, currentTarget: null }
+    activeGetIndex = opts.getIndex
 
     const handleOver = (e: MouseEvent): void => {
         const target = findHighlightTarget(e.target)
@@ -233,7 +260,7 @@ export const mountTooltip = (opts: MountTooltipOptions): (() => void) => {
             state.currentTarget = null
         }
         state.showTimer = window.setTimeout(() => {
-            showFor(target, opts.index)
+            showFor(target, opts.getIndex())
             if (state) state.showTimer = null
         }, HOVER_SHOW_DELAY_MS)
     }
@@ -317,6 +344,7 @@ export const mountTooltip = (opts: MountTooltipOptions): (() => void) => {
             state.element.remove()
             state = null
         }
+        activeGetIndex = null
         document.getElementById(TOOLTIP_STYLE_ELEMENT_ID)?.remove()
     }
 }

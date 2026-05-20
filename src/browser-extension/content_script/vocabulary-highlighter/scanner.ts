@@ -117,14 +117,20 @@ export const scanDocument = (index: VocabIndex): void => {
  * Returns a teardown function. The observer watches `document.body` for
  * added subtrees and incrementally highlights them. Debounced so SPA route
  * changes (which often emit hundreds of mutations) coalesce into one pass.
+ *
+ * Takes a getter rather than a value so that the live-refresh fast path (a
+ * description-only update that swaps `currentIndex`) doesn't have to tear
+ * down and rebuild the observer — subsequent SPA mutations will see the
+ * latest vocabulary at flush time.
  */
-export const startMutationObserver = (index: VocabIndex): (() => void) => {
-    if (index.size === 0) return () => undefined
+export const startMutationObserver = (getIndex: () => VocabIndex): (() => void) => {
+    if (getIndex().size === 0) return () => undefined
 
     let pending: Set<Node> = new Set()
     let timer: number | null = null
 
     const flush = (): void => {
+        const index = getIndex()
         const roots = Array.from(pending)
         pending = new Set()
         timer = null

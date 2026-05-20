@@ -79,6 +79,24 @@ export const silentSaveWord = async (rawText: string): Promise<SilentSaveResult>
     }
 }
 
+// Time between partial writes during streaming. Each write triggers a
+// vocabUpdated broadcast → fast-path refresh → tooltip rerender, so the
+// user watches the description fill in instead of staring at "翻译中…".
+const PARTIAL_FLUSH_THROTTLE_MS = 600
+
+// Mirror Translator.tsx's storage shape: drop the leading "word\n" header
+// the prompt is instructed to emit, so the description starts with the
+// actual definition / phonetic line.
+const formatDescription = (word: string, raw: string): string => {
+    const trimmed = raw.trim()
+    if (!trimmed) return ''
+    if (trimmed.toLowerCase().startsWith(word.toLowerCase())) {
+        const stripped = trimmed.slice(word.length).replace(/^[\s\n]+/, '').trim()
+        return stripped || trimmed
+    }
+    return trimmed
+}
+
 const runBackgroundTranslation = async (
     word: string,
     sourceLang: LangCode,
@@ -90,7 +108,34 @@ const runBackgroundTranslation = async (
 
         const chunks: string[] = []
         let finishedReason: string | null = null
+        let lastFlushAt = 0
+        let flushInFlight = false
+        let lastFlushedDescription = ''
         const controller = new AbortController()
+
+        const flushPartial = async (): Promise<void> => {
+            if (flushInFlight) return
+            const description = formatDescription(word, chunks.join(''))
+            if (!description || description === lastFlushedDescription) return
+            flushInFlight = true
+            try {
+                const existing = await vocabularyService.getItem(word)
+                await vocabularyService.putItem({
+                    word,
+                    reviewCount: existing?.reviewCount ?? 1,
+                    description,
+                    updatedAt: nowStamp(),
+                    createdAt: existing?.createdAt ?? nowStamp(),
+                })
+                lastFlushedDescription = description
+            } catch (err) {
+                // eslint-disable-next-line no-console
+                console.warn('[vocab-highlight] partial flush failed', err)
+            } finally {
+                lastFlushAt = Date.now()
+                flushInFlight = false
+            }
+        }
 
         await translate({
             action,
@@ -107,6 +152,11 @@ const runBackgroundTranslation = async (
                 } else {
                     chunks.push(m.content)
                 }
+                if (Date.now() - lastFlushAt >= PARTIAL_FLUSH_THROTTLE_MS) {
+                    // Fire-and-forget: keep streaming responsive while the
+                    // putItem RPC and downstream broadcast happen in parallel.
+                    void flushPartial()
+                }
             },
             onError: (err) => {
                 // eslint-disable-next-line no-console
@@ -117,23 +167,20 @@ const runBackgroundTranslation = async (
             },
         })
 
+        // Drain any in-flight partial flush so the final write definitely wins.
+        while (flushInFlight) {
+            await new Promise((r) => setTimeout(r, 30))
+        }
         if (finishedReason === null) return
 
-        const full = chunks.join('').trim()
-        if (!full) return
-
-        // The regular flow stores `translatedText.slice(word.length+1)` —
-        // i.e. everything after the leading "word\n". Mirror that so the
-        // description format matches what Translator.tsx would write.
-        const desc = full.toLowerCase().startsWith(word.toLowerCase())
-            ? full.slice(word.length).replace(/^[\s\n]+/, '').trim()
-            : full
+        const finalDescription = formatDescription(word, chunks.join(''))
+        if (!finalDescription || finalDescription === lastFlushedDescription) return
 
         const existing = await vocabularyService.getItem(word)
         await vocabularyService.putItem({
             word,
             reviewCount: existing?.reviewCount ?? 1,
-            description: desc || full,
+            description: finalDescription,
             updatedAt: nowStamp(),
             createdAt: existing?.createdAt ?? nowStamp(),
         })

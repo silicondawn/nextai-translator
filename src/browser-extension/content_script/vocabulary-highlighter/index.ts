@@ -2,8 +2,8 @@ import browser from 'webextension-polyfill'
 import { SETTINGS_KEY_ENABLED } from './consts'
 import { clearAllHighlights, ensureStyles } from './highlighter'
 import { scanDocument, startMutationObserver } from './scanner'
-import { mountTooltip, MountTooltipOptions } from './tooltip'
-import { loadVocabIndex } from './vocabStore'
+import { mountTooltip, MountTooltipOptions, refreshTooltipContent } from './tooltip'
+import { loadVocabIndex, VocabIndex } from './vocabStore'
 
 /**
  * Vocabulary Highlighter — public API.
@@ -17,12 +17,11 @@ import { loadVocabIndex } from './vocabStore'
  *   - Loads vocabulary on startup, builds stem index.
  *   - Walks page once, span-wraps matches.
  *   - Watches DOM mutations for SPA navigation / infinite scroll.
- *   - Hover tooltip showing the saved description (line-clamped); click on
- *     a highlight invokes the caller-supplied `onActivate` to open the full
- *     translator popup.
+ *   - Hover tooltip showing the saved description; click on a highlight
+ *     invokes the caller-supplied `onActivate` to open the full translator.
  *   - Live refresh: background broadcasts a `vocabUpdated` message after
- *     putItem/deleteItem, every tab tears down and re-bootstraps so newly
- *     saved words light up without a reload.
+ *     putItem/deleteItem. A description-only change updates the tooltip
+ *     in place (no DOM rebuild); add/remove triggers a full rescan.
  *
  * Not yet:
  *   - Per-site enable/disable UI.
@@ -36,8 +35,16 @@ export interface BootstrapOptions {
 const REFRESH_DEBOUNCE_MS = 150
 const REFRESH_MESSAGE_TYPE = 'vocabUpdated'
 
+const EMPTY_INDEX: VocabIndex = {
+    stemmedSet: new Set(),
+    stemToOriginals: new Map(),
+    stemToDescription: new Map(),
+    size: 0,
+}
+
 let teardown: (() => void) | null = null
 let currentOpts: BootstrapOptions = {}
+let currentIndex: VocabIndex = EMPTY_INDEX
 let updateListenerInstalled = false
 let refreshTimer: number | null = null
 
@@ -60,17 +67,24 @@ const isPageEligible = (): boolean => {
     return true
 }
 
+const stemmedSetsEqual = (a: Set<string>, b: Set<string>): boolean => {
+    if (a.size !== b.size) return false
+    for (const s of a) if (!b.has(s)) return false
+    return true
+}
+
 const runBootstrap = async (opts: BootstrapOptions): Promise<void> => {
     if (!isPageEligible()) return
     if (!(await isEnabled())) return
 
     const index = await loadVocabIndex()
+    currentIndex = index
     if (index.size === 0) return
 
     ensureStyles()
     scanDocument(index)
-    const stopMutations = startMutationObserver(index)
-    const stopTooltip = mountTooltip({ index, onActivate: opts.onActivate })
+    const stopMutations = startMutationObserver(() => currentIndex)
+    const stopTooltip = mountTooltip({ getIndex: () => currentIndex, onActivate: opts.onActivate })
     teardown = () => {
         stopMutations()
         stopTooltip()
@@ -79,16 +93,27 @@ const runBootstrap = async (opts: BootstrapOptions): Promise<void> => {
 
 const performRefresh = async (): Promise<void> => {
     try {
-        // Tear down observers, listeners, and the singleton tooltip — index
-        // is captured in their closures, so we need a clean rebuild rather
-        // than mutating the captured reference.
+        const old = currentIndex
+        const fresh = await loadVocabIndex()
+
+        // Fast path: word set unchanged (the streaming silent-save case —
+        // we're just filling in a description). The MutationObserver and
+        // tooltip both read currentIndex through a getter, so swapping it
+        // is enough to surface the new text. Update the tooltip's visible
+        // content if the user is hovering right now.
+        if (teardown !== null && stemmedSetsEqual(old.stemmedSet, fresh.stemmedSet)) {
+            currentIndex = fresh
+            refreshTooltipContent()
+            return
+        }
+
+        // Slow path: words were added or removed. Tear down highlights and
+        // rebuild — cheaper than tracking per-span add/remove for the volume
+        // we expect (single-digit changes per refresh).
         if (teardown) {
             teardown()
             teardown = null
         }
-        // Drop every previously-injected highlight span. The next scan only
-        // re-wraps words present in the *new* index, so removed words clear
-        // naturally and added words light up.
         clearAllHighlights()
         await runBootstrap(currentOpts)
     } catch (err) {
@@ -98,8 +123,8 @@ const performRefresh = async (): Promise<void> => {
 }
 
 const scheduleRefresh = (): void => {
-    // Debounce so a burst of putItem calls (rare today, but possible if a
-    // future import-from-CSV lands) collapses into one rescan.
+    // Debounce so a burst of putItem calls (e.g. streaming partial
+    // descriptions every 600ms) collapses sensibly under load.
     if (refreshTimer !== null) window.clearTimeout(refreshTimer)
     refreshTimer = window.setTimeout(() => {
         refreshTimer = null
@@ -142,4 +167,5 @@ export const teardownVocabularyHighlighter = (): void => {
         window.clearTimeout(refreshTimer)
         refreshTimer = null
     }
+    currentIndex = EMPTY_INDEX
 }
