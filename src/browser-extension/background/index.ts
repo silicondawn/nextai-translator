@@ -130,11 +130,38 @@ async function callMethod(request: any, service: any): Promise<any> {
     return { result }
 }
 
+// Mutating vocab-service methods that should invalidate every tab's
+// in-memory highlight index. Read-only methods (listItems, getItem, etc.)
+// are intentionally absent.
+const VOCAB_MUTATING_METHODS = new Set(['putItem', 'deleteItem'])
+
+async function broadcastVocabUpdated(): Promise<void> {
+    try {
+        const tabs = await browser.tabs.query({})
+        await Promise.all(
+            tabs.map((tab) =>
+                tab.id !== undefined
+                    ? browser.tabs.sendMessage(tab.id, { type: 'vocabUpdated' }).catch(() => undefined)
+                    : Promise.resolve()
+            )
+        )
+    } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn('[vocab-highlight] broadcast failed', err)
+    }
+}
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 browser.runtime.onMessage.addListener(async (request) => {
     switch (request.type) {
         case BackgroundEventNames.vocabularyService:
-            return await callMethod(request, vocabularyInternalService)
+            const vocabResult = await callMethod(request, vocabularyInternalService)
+            if (VOCAB_MUTATING_METHODS.has(request.method)) {
+                // Fire-and-forget; broadcast errors must never reject the
+                // caller's putItem/deleteItem promise.
+                broadcastVocabUpdated()
+            }
+            return vocabResult
         case BackgroundEventNames.actionService:
             return await callMethod(request, actionInternalService)
         case BackgroundEventNames.historyService:
