@@ -139,8 +139,11 @@ const runBackgroundTranslation = async (
 
         await translate({
             action,
+            // text-only, no `selectedWord` — passing both flips translate.ts
+            // into "word-in-sentence" mode (line 346), whose prompt template
+            // emits literal '<word>' / '<the remaining part>' placeholders
+            // when there's no real sentence context to substitute them with.
             text: word,
-            selectedWord: word,
             detectFrom: sourceLang,
             detectTo: targetLang,
             signal: controller.signal,
