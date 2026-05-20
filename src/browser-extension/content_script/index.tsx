@@ -257,7 +257,17 @@ async function main() {
 
     // Fire-and-forget: highlighter is fully self-contained and swallows its own errors,
     // so it can never block or break the primary selection-translation flow.
-    bootstrapVocabularyHighlighter()
+    bootstrapVocabularyHighlighter({
+        onActivate: (word, anchor) => {
+            // Clicking a highlighted vocab word opens the full translator card
+            // anchored to the span. The hover tooltip handles the "quick glance"
+            // path; this is the deep-dive path.
+            showPopupCard(anchor, word).catch((err) => {
+                // eslint-disable-next-line no-console
+                console.warn('[vocab-highlight] showPopupCard failed', err)
+            })
+        },
+    })
 }
 
 export async function bindHotKey(hotkey_: string | undefined) {

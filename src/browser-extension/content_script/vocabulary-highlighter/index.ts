@@ -2,6 +2,7 @@ import browser from 'webextension-polyfill'
 import { SETTINGS_KEY_ENABLED } from './consts'
 import { ensureStyles } from './highlighter'
 import { scanDocument, startMutationObserver } from './scanner'
+import { mountTooltip, MountTooltipOptions } from './tooltip'
 import { loadVocabIndex } from './vocabStore'
 
 /**
@@ -16,13 +17,19 @@ import { loadVocabIndex } from './vocabStore'
  *   - Loads vocabulary on startup, builds stem index.
  *   - Walks page once, span-wraps matches.
  *   - Watches DOM mutations for SPA navigation / infinite scroll.
+ *   - Hover tooltip showing the saved description (line-clamped); click on
+ *     a highlight invokes the caller-supplied `onActivate` to open the full
+ *     translator popup.
  *
  * Not in MVP (tracked in module README):
- *   - Hover tooltip wiring into the existing translator popup.
  *   - Reactive refresh when a word is added/removed mid-session.
  *   - Per-site enable/disable UI.
  *   - CSS Custom Highlight API renderer.
  */
+
+export interface BootstrapOptions {
+    onActivate?: MountTooltipOptions['onActivate']
+}
 
 let teardown: (() => void) | null = null
 
@@ -45,7 +52,7 @@ const isPageEligible = (): boolean => {
     return true
 }
 
-export const bootstrapVocabularyHighlighter = async (): Promise<void> => {
+export const bootstrapVocabularyHighlighter = async (opts: BootstrapOptions = {}): Promise<void> => {
     try {
         if (!isPageEligible()) return
         if (!(await isEnabled())) return
@@ -55,8 +62,12 @@ export const bootstrapVocabularyHighlighter = async (): Promise<void> => {
 
         ensureStyles()
         scanDocument(index)
-        const stop = startMutationObserver(index)
-        teardown = stop
+        const stopMutations = startMutationObserver(index)
+        const stopTooltip = mountTooltip({ index, onActivate: opts.onActivate })
+        teardown = () => {
+            stopMutations()
+            stopTooltip()
+        }
     } catch (err) {
         // eslint-disable-next-line no-console
         console.warn('[vocab-highlight] bootstrap failed', err)
