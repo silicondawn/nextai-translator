@@ -137,6 +137,60 @@ export const clearAllHighlights = (): void => {
 }
 
 /**
+ * Drop all ranges anchored on `node` and forget that we've processed it,
+ * so a subsequent `highlightTextNode` call can re-scan it. Used when a
+ * MutationObserver characterData record tells us the text contents have
+ * changed under our feet — the old offsets are no longer meaningful.
+ */
+export const dropRangesOnTextNode = (node: Text): void => {
+    if (!highlight) return
+    let touched = false
+    for (const [word, bucket] of wordRanges) {
+        let dropped = 0
+        const live: Range[] = []
+        for (const r of bucket) {
+            if (r.startContainer === node) {
+                highlight.delete(r)
+                dropped++
+            } else {
+                live.push(r)
+            }
+        }
+        if (dropped === 0) continue
+        touched = true
+        if (live.length === 0) wordRanges.delete(word)
+        else wordRanges.set(word, live)
+    }
+    if (touched) processedNodes.delete(node)
+}
+
+/**
+ * Walk the in-memory range index and drop any range whose anchor text node
+ * has been detached from the document. Called from the MutationObserver
+ * flush — handling `removedNodes` proactively this way avoids paying for a
+ * subtree walk on every removal and is robust even when a SPA blows away
+ * a whole pane.
+ */
+export const pruneDeadRanges = (): void => {
+    if (!highlight) return
+    for (const [word, bucket] of wordRanges) {
+        let pruned = 0
+        const live: Range[] = []
+        for (const r of bucket) {
+            if (r.startContainer.isConnected) {
+                live.push(r)
+            } else {
+                highlight.delete(r)
+                pruned++
+            }
+        }
+        if (pruned === 0) continue
+        if (live.length === 0) wordRanges.delete(word)
+        else wordRanges.set(word, live)
+    }
+}
+
+/**
  * Map a viewport point to one of our highlighted ranges, if any.
  *
  * Used by the tooltip's hover and click handlers in lieu of the

@@ -120,12 +120,17 @@ const runBackgroundTranslation = async (
             flushInFlight = true
             try {
                 const existing = await vocabularyService.getItem(word)
+                // The user may have deleted this word from their vocabulary
+                // book while we were streaming — don't resurrect it. Abort
+                // the rest of the translation too: there's no entry to fill.
+                if (!existing) {
+                    controller.abort()
+                    return
+                }
                 await vocabularyService.putItem({
-                    word,
-                    reviewCount: existing?.reviewCount ?? 1,
+                    ...existing,
                     description,
                     updatedAt: nowStamp(),
-                    createdAt: existing?.createdAt ?? nowStamp(),
                 })
                 lastFlushedDescription = description
             } catch (err) {
@@ -180,12 +185,13 @@ const runBackgroundTranslation = async (
         if (!finalDescription || finalDescription === lastFlushedDescription) return
 
         const existing = await vocabularyService.getItem(word)
+        // Same guard as flushPartial: if the entry has been deleted from the
+        // vocabulary book during streaming, don't resurrect it here.
+        if (!existing) return
         await vocabularyService.putItem({
-            word,
-            reviewCount: existing?.reviewCount ?? 1,
+            ...existing,
             description: finalDescription,
             updatedAt: nowStamp(),
-            createdAt: existing?.createdAt ?? nowStamp(),
         })
     } catch (err) {
         // eslint-disable-next-line no-console

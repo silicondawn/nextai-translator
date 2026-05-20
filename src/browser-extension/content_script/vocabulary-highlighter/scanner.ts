@@ -1,6 +1,6 @@
 import { popupCardID, popupThumbID } from '../consts'
 import { MAX_TEXT_NODES, MUTATION_DEBOUNCE_MS, SCAN_CHUNK_SIZE, TOOLTIP_ELEMENT_ID } from './consts'
-import { highlightTextNode } from './highlighter'
+import { dropRangesOnTextNode, highlightTextNode, pruneDeadRanges } from './highlighter'
 import { VocabIndex } from './vocabStore'
 
 /**
@@ -13,6 +13,14 @@ import { VocabIndex } from './vocabStore'
  *   thread for more than ~5ms at a time.
  * - Reacts to DOM mutations with a debounced incremental scan, so
  *   infinite-scroll feeds (Twitter, Reddit, blogs) stay covered.
+ * - Cancellable: every in-flight idle scan is gated on a monotonically
+ *   increasing epoch. `cancelInFlightScans()` bumps the epoch, so any
+ *   queued tick exits at its next callback without touching the new
+ *   vocab index.
+ * - Watches `characterData` mutations too (React/Vue text interpolation
+ *   replaces a node's text in place rather than swapping the node), and
+ *   prunes stale ranges on `removedNodes` so detached highlights don't
+ *   linger in memory.
  */
 
 // Tags whose text content we never highlight.
@@ -68,16 +76,41 @@ const collectTextNodes = (root: Node, limit: number): Text[] => {
     return out
 }
 
-const requestIdle = (cb: (deadline: IdleDeadline) => void): number => {
+// Bumped by `cancelInFlightScans`. Each idle tick captures its epoch and
+// bails on next entry once a newer epoch is seen — so a queued scan that
+// was about to highlight under the *old* index can never write into the
+// post-teardown world.
+let scanEpoch = 0
+// The id of the most-recently-scheduled idle/timeout callback so we can
+// cancel it pre-flight when teardown happens between ticks.
+let pendingIdle: { type: 'idle' | 'timeout'; id: number } | null = null
+
+const requestIdle = (cb: (deadline: IdleDeadline) => void): void => {
     if (typeof window.requestIdleCallback === 'function') {
-        return window.requestIdleCallback(cb, { timeout: 1000 })
+        const id = window.requestIdleCallback(cb, { timeout: 1000 })
+        pendingIdle = { type: 'idle', id }
+    } else {
+        // Safari fallback (Tauri/Safari builds).
+        const id = window.setTimeout(() => cb({ timeRemaining: () => 16, didTimeout: false } as IdleDeadline), 16)
+        pendingIdle = { type: 'timeout', id }
     }
-    // Safari fallback (Tauri/Safari builds).
-    return window.setTimeout(() => cb({ timeRemaining: () => 16, didTimeout: false } as IdleDeadline), 16)
+}
+
+const cancelPendingIdle = (): void => {
+    if (!pendingIdle) return
+    if (pendingIdle.type === 'idle' && typeof window.cancelIdleCallback === 'function') {
+        window.cancelIdleCallback(pendingIdle.id)
+    } else {
+        window.clearTimeout(pendingIdle.id)
+    }
+    pendingIdle = null
 }
 
 const scanQueue = (queue: Text[], index: VocabIndex, onChunkDone?: () => void): void => {
+    const myEpoch = scanEpoch
     const tick = (deadline: IdleDeadline): void => {
+        pendingIdle = null
+        if (myEpoch !== scanEpoch) return // teardown happened — drop this scan
         let processedThisTick = 0
         while (queue.length > 0 && deadline.timeRemaining() > 4 && processedThisTick < SCAN_CHUNK_SIZE) {
             const node = queue.shift()
@@ -99,6 +132,15 @@ const scanQueue = (queue: Text[], index: VocabIndex, onChunkDone?: () => void): 
 }
 
 /**
+ * Cancel any idle-scheduled scan currently waiting to run, and invalidate
+ * any tick that's already mid-iteration. Called from observer teardown.
+ */
+export const cancelInFlightScans = (): void => {
+    scanEpoch++
+    cancelPendingIdle()
+}
+
+/**
  * Full-page scan. Use on initial page load.
  */
 export const scanDocument = (index: VocabIndex): void => {
@@ -109,8 +151,9 @@ export const scanDocument = (index: VocabIndex): void => {
 
 /**
  * Returns a teardown function. The observer watches `document.body` for
- * added subtrees and incrementally highlights them. Debounced so SPA route
- * changes (which often emit hundreds of mutations) coalesce into one pass.
+ * added subtrees, in-place text changes, and removals, then incrementally
+ * highlights / prunes accordingly. Debounced so SPA route changes (which
+ * often emit hundreds of mutations) coalesce into one pass.
  *
  * Takes a getter rather than a value so that the live-refresh fast path (a
  * description-only update that swaps `currentIndex`) doesn't have to tear
@@ -120,15 +163,37 @@ export const scanDocument = (index: VocabIndex): void => {
 export const startMutationObserver = (getIndex: () => VocabIndex): (() => void) => {
     if (getIndex().size === 0) return () => undefined
 
-    let pending: Set<Node> = new Set()
+    let pendingRoots: Set<Node> = new Set()
+    let pendingTextChanges: Set<Text> = new Set()
+    let sawRemoval = false
     let timer: number | null = null
 
     const flush = (): void => {
         const index = getIndex()
-        const roots = Array.from(pending)
-        pending = new Set()
+        const roots = Array.from(pendingRoots)
+        const textChanges = Array.from(pendingTextChanges)
+        const hadRemoval = sawRemoval
+        pendingRoots = new Set()
+        pendingTextChanges = new Set()
+        sawRemoval = false
         timer = null
+
+        // Removals leave stale ranges anchored on detached text nodes.
+        // Sweep them out before processing additions so we don't waste
+        // hit-test work on dead entries.
+        if (hadRemoval) pruneDeadRanges()
+
+        // In-place text edits (`characterData`): the existing ranges on
+        // these nodes point into the *old* offsets and must be dropped
+        // before re-scanning the new content.
         const queue: Text[] = []
+        for (const node of textChanges) {
+            if (!node.isConnected || shouldSkipNode(node)) continue
+            dropRangesOnTextNode(node)
+            queue.push(node)
+        }
+
+        // Newly-added subtrees: collect text nodes the usual way.
         for (const root of roots) {
             if (!root.isConnected) continue
             if (root.nodeType === Node.TEXT_NODE) {
@@ -144,19 +209,28 @@ export const startMutationObserver = (getIndex: () => VocabIndex): (() => void) 
 
     const observer = new MutationObserver((mutations) => {
         for (const m of mutations) {
-            if (m.type !== 'childList') continue
-            m.addedNodes.forEach((n) => pending.add(n))
+            if (m.type === 'childList') {
+                m.addedNodes.forEach((n) => pendingRoots.add(n))
+                if (m.removedNodes.length > 0) sawRemoval = true
+            } else if (m.type === 'characterData') {
+                if (m.target.nodeType === Node.TEXT_NODE) {
+                    pendingTextChanges.add(m.target as Text)
+                }
+            }
         }
-        if (pending.size === 0) return
+        if (pendingRoots.size === 0 && pendingTextChanges.size === 0 && !sawRemoval) return
         if (timer !== null) window.clearTimeout(timer)
         timer = window.setTimeout(flush, MUTATION_DEBOUNCE_MS)
     })
 
-    observer.observe(document.body, { childList: true, subtree: true })
+    observer.observe(document.body, { childList: true, subtree: true, characterData: true })
 
     return () => {
         observer.disconnect()
         if (timer !== null) window.clearTimeout(timer)
-        pending.clear()
+        pendingRoots.clear()
+        pendingTextChanges.clear()
+        sawRemoval = false
+        cancelInFlightScans()
     }
 }
