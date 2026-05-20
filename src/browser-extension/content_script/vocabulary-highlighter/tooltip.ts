@@ -52,14 +52,16 @@ const ensureTooltipStyles = (): void => {
         #${TOOLTIP_ELEMENT_ID} {
             position: fixed !important;
             z-index: 2147483646 !important;
-            max-width: 280px !important;
-            padding: 8px 12px !important;
+            max-width: 360px !important;
+            min-width: 200px !important;
+            max-height: 60vh !important;
+            padding: 10px 14px !important;
             background-color: #ffffff !important;
             color: #1a1a1a !important;
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
                 'Helvetica Neue', Arial, sans-serif !important;
             font-size: 13px !important;
-            line-height: 1.45 !important;
+            line-height: 1.5 !important;
             border: 1px solid rgba(0, 0, 0, 0.08) !important;
             border-radius: 6px !important;
             box-shadow:
@@ -68,13 +70,13 @@ const ensureTooltipStyles = (): void => {
             opacity: 0 !important;
             transition: opacity 80ms ease-out !important;
             pointer-events: none !important;
-            display: -webkit-box !important;
-            -webkit-line-clamp: 3 !important;
-            -webkit-box-orient: vertical !important;
-            overflow: hidden !important;
-            text-overflow: ellipsis !important;
-            white-space: normal !important;
+            /* Translator descriptions are multi-line (phonetic + sense + example +
+               bilingual). Preserve newlines and let the tooltip grow to its
+               natural height so the user can read the whole entry at once. */
+            white-space: pre-wrap !important;
             word-break: break-word !important;
+            overflow-wrap: anywhere !important;
+            overflow: hidden !important;
             visibility: hidden !important;
         }
         #${TOOLTIP_ELEMENT_ID}[data-visible='true'] {
@@ -112,16 +114,37 @@ const positionTooltip = (tooltip: HTMLElement, anchor: HTMLElement): void => {
     const tipRect = tooltip.getBoundingClientRect()
     const tipW = tipRect.width
     const tipH = tipRect.height
+    const vw = window.innerWidth
+    const vh = window.innerHeight
+    const pad = TOOLTIP_VIEWPORT_PADDING_PX
+    const gap = TOOLTIP_GAP_PX
 
-    // Horizontal: centred on anchor, clamped to viewport with 8px gutter.
+    // Horizontal: centred on anchor, clamped to viewport.
     let left = anchorRect.left + anchorRect.width / 2 - tipW / 2
-    const maxLeft = window.innerWidth - tipW - TOOLTIP_VIEWPORT_PADDING_PX
-    left = Math.max(TOOLTIP_VIEWPORT_PADDING_PX, Math.min(left, maxLeft))
+    left = Math.max(pad, Math.min(left, vw - tipW - pad))
 
-    // Vertical: above by default, flip below if not enough room.
+    // Vertical: try above first; if no room, try below; if neither side
+    // has space (short viewport or very tall content), clamp to viewport
+    // bounds so we never anchor off-screen.
     const spaceAbove = anchorRect.top
-    const needed = tipH + TOOLTIP_GAP_PX + TOOLTIP_VIEWPORT_PADDING_PX
-    const top = spaceAbove >= needed ? anchorRect.top - tipH - TOOLTIP_GAP_PX : anchorRect.bottom + TOOLTIP_GAP_PX
+    const spaceBelow = vh - anchorRect.bottom
+    const needed = tipH + gap + pad
+    let top: number
+    if (spaceAbove >= needed) {
+        top = anchorRect.top - tipH - gap
+    } else if (spaceBelow >= needed) {
+        top = anchorRect.bottom + gap
+    } else {
+        // Neither side fits comfortably. Clamp so the tooltip body lives
+        // inside the viewport, even if that means overlapping the anchor.
+        // When tipH itself exceeds the viewport, pin to the top — the user
+        // sees the first lines and can click the highlight for the full card.
+        if (tipH + 2 * pad > vh) {
+            top = pad
+        } else {
+            top = Math.max(pad, vh - tipH - pad)
+        }
+    }
 
     tooltip.style.left = `${left}px`
     tooltip.style.top = `${top}px`
