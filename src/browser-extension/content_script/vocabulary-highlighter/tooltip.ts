@@ -92,11 +92,24 @@ const ensureTooltipStyles = (): void => {
             opacity: 1 !important;
             visibility: visible !important;
         }
+        #${TOOLTIP_ELEMENT_ID} strong {
+            font-weight: 600 !important;
+        }
+        #${TOOLTIP_ELEMENT_ID} code {
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace !important;
+            font-size: 0.92em !important;
+            background-color: rgba(0, 0, 0, 0.06) !important;
+            padding: 0 4px !important;
+            border-radius: 3px !important;
+        }
         @media (prefers-color-scheme: dark) {
             #${TOOLTIP_ELEMENT_ID} {
                 background-color: #2a2a2a !important;
                 color: #f0f0f0 !important;
                 border-color: rgba(255, 255, 255, 0.1) !important;
+            }
+            #${TOOLTIP_ELEMENT_ID} code {
+                background-color: rgba(255, 255, 255, 0.08) !important;
             }
         }
     `
@@ -174,11 +187,45 @@ const wordOf = (target: HTMLElement): string => {
 // the next vocabUpdated broadcast will refresh the index with the real text.
 const PENDING_PLACEHOLDER = '翻译中…'
 
+// Minimal markdown -> HTML renderer.
+//
+// Translator output uses **bold** liberally (the saved word, parts of
+// speech, phonetic labels) and occasional `inline code`. Everything else
+// (line breaks, paragraph layout) is already handled by `white-space:
+// pre-wrap` in the tooltip stylesheet, so we don't need a full markdown
+// engine — react-markdown plus React would dwarf the rest of the module.
+//
+// All input is HTML-escaped before any tag substitution: descriptions
+// originate from the user's own LLM provider, but the cost of being
+// defensive here is one regex pass.
+const HTML_ESCAPE_MAP: Record<string, string> = {
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;',
+}
+
+const escapeHtml = (s: string): string => s.replace(/[&<>"']/g, (c) => HTML_ESCAPE_MAP[c] ?? c)
+
+const renderInlineMarkdown = (raw: string): string =>
+    escapeHtml(raw)
+        // Bold: **text**. Non-greedy + [\s\S] so it spans newlines if needed.
+        // A partially-streamed '**word' (closing pair not yet received) just
+        // shows the literal asterisks for a moment — the next streamed chunk
+        // closes the pair and the next refresh renders it correctly.
+        .replace(/\*\*([\s\S]+?)\*\*/g, '<strong>$1</strong>')
+        // Inline code: `text` on a single line.
+        .replace(/`([^`\n]+)`/g, '<code>$1</code>')
+
 const renderContentFor = (target: HTMLElement, index: VocabIndex): void => {
     if (!state) return
     const description = lookupDescription(index, wordOf(target))
-    const content = description && description.length > 0 ? description : PENDING_PLACEHOLDER
-    state.element.textContent = content
+    if (description && description.length > 0) {
+        state.element.innerHTML = renderInlineMarkdown(description)
+    } else {
+        state.element.textContent = PENDING_PLACEHOLDER
+    }
 }
 
 const showFor = (target: HTMLElement, index: VocabIndex): void => {
