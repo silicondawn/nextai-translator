@@ -137,11 +137,16 @@ const wordOf = (target: HTMLElement): string => {
     return target.getAttribute(DATA_ATTR_ORIGINAL) ?? target.textContent ?? ''
 }
 
+// Shown while the background translation is still streaming. A highlighted
+// word that lacks a description means it was silent-saved very recently;
+// the next vocabUpdated broadcast will refresh the index with the real text.
+const PENDING_PLACEHOLDER = '翻译中…'
+
 const showFor = (target: HTMLElement, index: VocabIndex): void => {
     if (!state) return
     const description = lookupDescription(index, wordOf(target))
-    if (!description) return
-    state.element.textContent = description
+    const content = description && description.length > 0 ? description : PENDING_PLACEHOLDER
+    state.element.textContent = content
     state.element.setAttribute('aria-hidden', 'false')
     positionTooltip(state.element, target)
     state.element.dataset['visible'] = 'true'

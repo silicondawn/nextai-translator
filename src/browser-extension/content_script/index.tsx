@@ -1,7 +1,6 @@
 import '../enable-dev-hmr'
 import * as utils from '@/common/utils'
 import React from 'react'
-import icon from '@/common/assets/images/icon.png'
 import { popupCardID, popupCardOffset, popupThumbID, zIndex } from './consts'
 import { Translator } from '@/common/components/Translator'
 import { InlineLookupContainer } from './InlineLookupContainer'
@@ -21,6 +20,15 @@ import InnerContainer from './InnerContainer'
 import TitleBar from './TitleBar'
 import { setExternalOriginalText } from '@/common/store'
 import { bootstrapVocabularyHighlighter } from './vocabulary-highlighter'
+import { silentSaveWord } from './vocabulary-highlighter/silentSave'
+
+// Inline SVG for the popup thumb: a yellow highlighter bar with a thin
+// horizontal stroke — visually signals "mark this word" without text.
+const THUMB_ICON_SVG = `
+<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'>
+    <rect x='2' y='5.5' width='12' height='5' rx='0.6' fill='#FFDE59' opacity='0.9'/>
+    <line x1='3' y1='8' x2='13' y2='8' stroke='#1a1a1a' stroke-width='1.4' stroke-linecap='round'/>
+</svg>`
 
 let root: Root | null = null
 const generateId = createGenerateId()
@@ -33,7 +41,16 @@ async function popupThumbClickHandler(event: UserEventType) {
     if (!$popupThumb) {
         return
     }
-    showPopupCard($popupThumb, $popupThumb.dataset['text'] || '')
+    const text = $popupThumb.dataset['text'] || ''
+    // Hide the thumb up front — silent save shouldn't leave a hovering UI
+    // chrome while the background translation streams in.
+    $popupThumb.style.visibility = 'hidden'
+    // Fire and forget; silentSaveWord swallows its own errors and the live-
+    // refresh broadcast handles re-rendering the highlight + tooltip.
+    silentSaveWord(text).catch((err) => {
+        // eslint-disable-next-line no-console
+        console.warn('[vocab-highlight] thumb click silent-save failed', err)
+    })
 }
 
 async function removeContainer() {
@@ -174,12 +191,16 @@ async function showPopupThumb(text: string, x: number, y: number) {
         $popupThumb.addEventListener('touchmove', (event) => {
             event.stopPropagation()
         })
-        const $img = document.createElement('img')
-        $img.src = utils.getAssetUrl(icon)
-        $img.style.display = 'block'
-        $img.style.width = '100%'
-        $img.style.height = '100%'
-        $popupThumb.appendChild($img)
+        // The button now triggers a silent vocab-save (highlight + background
+        // translation) instead of opening the full translator card, so we use
+        // a highlighter-bar icon rather than the app logo.
+        $popupThumb.innerHTML = THUMB_ICON_SVG
+        const $svg = $popupThumb.querySelector('svg')
+        if ($svg) {
+            $svg.setAttribute('width', '100%')
+            $svg.setAttribute('height', '100%')
+            ;($svg as unknown as HTMLElement).style.display = 'block'
+        }
         const $container = await getContainer()
         $container.shadowRoot?.querySelector('div')?.appendChild($popupThumb)
     }
